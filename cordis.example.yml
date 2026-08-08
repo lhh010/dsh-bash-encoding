@@ -1,0 +1,19 @@
+# dsh-bash-encoding 接入示例（片段）
+#
+# 放在 DSH profile（如 ~/.dsh/profiles/web/cordis.yml）中，替换原 bash 条目。
+# 注意：同一 context 只能有一个 ctx.bash 实现，原 @deepseek-ai/dsh-bash-local
+# 或 @deepseek-ai/dsh-bash-sandbox 条目需移除，避免重复注册报错。
+
+- id: bash
+  name: '@dsh-external/dsh-bash-encoding'
+  config:
+    # 默认工作目录；缺省时用 process.cwd()
+    cwd: null
+    # 前台命令默认超时（毫秒）
+    timeoutMs: 120000
+    # 单次调用可覆盖的超时上限（毫秒）
+    maxTimeoutMs: 600000
+    # 每流（stdout/stderr）输出上限（字节），超限保留头部并标记 lossy
+    maxOutputBytes: 65536
+    # SIGTERM → SIGKILL 宽限期（毫秒）
+    graceMs: 3000

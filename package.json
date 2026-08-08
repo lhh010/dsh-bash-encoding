@@ -1,0 +1,33 @@
+{
+  "name": "@dsh-external/dsh-bash-encoding",
+  "version": "0.1.0",
+  "description": "DSH bash 输出编码自动识别插件：替换 ctx.bash，自管 spawn 收集原始字节，自动检测 UTF-16LE/UTF-8/GBK 等编码并正确解码，修复 WSL/Windows 下 bash 工具的中文乱码。",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": { "types": "./lib/types/index.d.ts", "default": "./lib/index.js" },
+    "./decode-core": { "types": "./lib/types/decode-core.d.ts", "default": "./lib/decode-core.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "src"],
+  "license": "BSD-3-Clause",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"tests/*.test.js\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-bash": "*",
+    "cordis": "^4.0.0-rc.7",
+    "schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-bash": "link:../.dsh/source/current/packages/bash/bash",
+    "@types/node": "^22.0.0",
+    "cordis": "link:../.dsh/source/current/vendor/cordis",
+    "schemastery": "link:../.dsh/source/current/vendor/schemastery",
+    "typescript": "^5.9.0"
+  }
+}
