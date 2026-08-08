@@ -7,11 +7,20 @@
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
-    ".": { "types": "./lib/types/index.d.ts", "default": "./lib/index.js" },
-    "./decode-core": { "types": "./lib/types/decode-core.d.ts", "default": "./lib/decode-core.js" },
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./decode-core": {
+      "types": "./lib/types/decode-core.d.ts",
+      "default": "./lib/decode-core.js"
+    },
     "./package.json": "./package.json"
   },
-  "files": ["lib", "src"],
+  "files": [
+    "lib",
+    "src"
+  ],
   "license": "BSD-3-Clause",
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -28,6 +37,7 @@
     "@types/node": "^22.0.0",
     "cordis": "link:../.dsh/source/current/vendor/cordis",
     "schemastery": "link:../.dsh/source/current/vendor/schemastery",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "@deepseek-ai/dsh-sandbox": "link:../.dsh/source/current/packages/sandbox/sandbox"
   }
 }

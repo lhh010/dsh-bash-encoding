@@ -31,6 +31,7 @@ import type {
   BashRunResult,
   CollectedOutput,
 } from '@deepseek-ai/dsh-bash'
+import type { SandboxEnforcement, SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import { decodeBuffer } from './decode-core.js'
 
 /** Model-friendly terminal overrides, mirroring `dsh-bash-local`. */
@@ -59,14 +60,21 @@ const CREDENTIAL_MARKERS = ['KEY', 'PASSWORD', 'SECRET', 'TOKEN']
 /** Ambient `DSH_*` variables are scrubbed; managed facts arrive via `dshEnv`. */
 const DSH_PREFIX = 'DSH_'
 
-/**
- * A captured byte stream: raw chunks plus the final byte count. Decoding
+/** A captured byte stream: raw chunks plus the final byte count. Decoding
  * happens once at read time so incremental readers see consistent text.
  */
 interface ByteStream {
   chunks: Buffer[]
   bytes: number
   capped: boolean
+}
+
+/** Confinement facts retained from a `ctx.sandbox.confine` wrap. */
+interface ConfinedFacts {
+  /** The provider's wrapped argv, executed in place of the raw `bash -c`. */
+  argv: readonly string[]
+  /** Enforcement evidence reported by the provider (may be null/absent). */
+  enforcement: SandboxEnforcement | null | undefined
 }
 
 /** Plugin config (all optional — schemastery supplies the defaults). */
@@ -123,22 +131,44 @@ function concatHead(stream: ByteStream): Buffer {
  * Encoding-aware local bash executor over `node:child_process`. One spawn per
  * `run`/`start`; the process group is owned and killed on timeout, abort, or
  * caller `kill()`.
+ *
+ * Sandbox support is OPTIONAL and detected at run time via `ctx.get`:
+ * when a `ctx.sandbox` provider and `ctx.sandboxPolicy` service are present
+ * (like the vanilla `dsh-bash-sandbox` composition), non-full-access specs
+ * are confined through the provider before spawning; when they are absent
+ * (a plain `dsh-bash-local` composition), commands run unconfined. The
+ * result carries the same `sandbox` facts as the sandbox executor.
  */
 export class EncodingBashExecutor extends BashExecutor {
   /** Validated config (schemastery filled defaults before construction). */
   readonly config: ResolvedConfig
 
+  /** The resolved default mode, when a sandbox policy service is present. */
+  private readonly defaultMode: SandboxMode | undefined
+
   constructor(ctx: import('cordis').Context, config: EncodingBashConfig) {
     super(ctx)
     this.config = config as ResolvedConfig
+    const policy = ctx.get('sandboxPolicy')
+    this.defaultMode = policy?.defaultMode
   }
 
-  /** Resolve a request into a fully-specified spec, capping overrides. */
+  /** The default mode when the sandbox policy service is present, else undefined. */
+  override get sandboxMode(): SandboxMode | undefined {
+    return this.defaultMode
+  }
+
+  /**
+   * Resolve a request into a fully-specified spec, capping overrides. When a
+   * sandbox policy service is present and the request carries none, the
+   * deployment default policy is stamped, mirroring `dsh-bash-sandbox`.
+   */
   resolve(request: BashExecRequest): BashExecSpec {
     const timeoutMs = Math.max(
       0,
       Math.min(request.timeoutMs ?? this.config.timeoutMs, this.config.maxTimeoutMs),
     )
+    const policy = request.sandboxPolicy ?? this.ctx.get('sandboxPolicy')?.resolve()
     return {
       command: request.command,
       workdir: request.workdir ?? this.config.cwd ?? process.cwd(),
@@ -148,19 +178,37 @@ export class EncodingBashExecutor extends BashExecutor {
       ...request.stdin !== undefined ? { stdin: request.stdin } : {},
       ...request.env !== undefined ? { env: request.env } : {},
       ...request.dshEnv !== undefined ? { dshEnv: request.dshEnv } : {},
-      sandboxPolicy: request.sandboxPolicy,
+      sandboxPolicy: policy,
     }
   }
 
-  /** Spawn `bash -c` with raw-byte pipes and a scrubbed, overridden environment. */
-  private spawnBash(spec: BashExecSpec): ChildProcess {
+  /**
+   * Resolve the spawn argv: confine the `bash -c` through `ctx.sandbox` when
+   * the policy demands it, otherwise pass it through verbatim.
+   * @returns the argv to spawn and the confinement facts, when confined.
+   */
+  private resolveArgv(spec: BashExecSpec): { argv: string[]; confined: ConfinedFacts | undefined } {
+    const sandbox = this.ctx.get('sandbox')
+    const policy = spec.sandboxPolicy
+    const { mode } = policy ?? {}
+    if (sandbox !== undefined && policy !== undefined && mode !== undefined && mode !== 'danger-full-access') {
+      // The full-access arm is excluded above, so `mode` narrows to the
+      // confine contract's ConfinedSandboxMode; spread preserves the rest.
+      const confined = sandbox.confine(['bash', '-c', spec.command], { ...policy, mode })
+      return { argv: [...confined.argv], confined: { argv: confined.argv, enforcement: confined.enforcement } }
+    }
+    return { argv: ['bash', '-c', spec.command], confined: undefined }
+  }
+
+  /** Spawn with raw-byte pipes and a scrubbed, overridden environment. */
+  private spawnBash(spec: BashExecSpec, argv: string[]): ChildProcess {
     const env = {
       ...scrubAmbient(process.env),
       ...ENV_OVERRIDES,
       ...spec.env,
       ...spec.dshEnv,
     }
-    const child = spawn('bash', ['-c', spec.command], {
+    const child = spawn(argv[0], argv.slice(1), {
       cwd: spec.workdir,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -202,9 +250,12 @@ export class EncodingBashExecutor extends BashExecutor {
     const stdoutCap = spec.stdoutMaxBytes
     const stderrCap = this.config.maxOutputBytes
 
+    const { argv, confined } = this.resolveArgv(spec)
+    const policy = spec.sandboxPolicy
+
     let child: ChildProcess
     try {
-      child = this.spawnBash(spec)
+      child = this.spawnBash(spec, argv)
     } catch (error) {
       // Spawn failures settle as killed, with the error on stderr.
       return {
@@ -269,6 +320,13 @@ export class EncodingBashExecutor extends BashExecutor {
     const stderrText = spawnError !== undefined
       ? `${spawnError}\n`
       : decodeBuffer(concatHead(stderr)).text
+    const sandbox = confined !== undefined && policy !== undefined
+      ? {
+          mode: policy.mode,
+          denied: false,
+          ...confined.enforcement != null ? { enforcement: confined.enforcement } : {},
+        }
+      : undefined
     return {
       ...outcome,
       timedOut,
@@ -276,6 +334,7 @@ export class EncodingBashExecutor extends BashExecutor {
       timeoutMs: spec.timeoutMs,
       stdout: finalize(stdout),
       stderr: { text: stderrText, truncated: stderr.capped },
+      ...sandbox !== undefined ? { sandbox } : {},
     }
   }
 
@@ -285,10 +344,13 @@ export class EncodingBashExecutor extends BashExecutor {
     const stderr: ByteStream = { chunks: [], bytes: 0, capped: false }
     const cap = this.config.maxOutputBytes
 
+    const { argv, confined } = this.resolveArgv(spec)
+    const policy = spec.sandboxPolicy
+
     let child: ChildProcess
     let spawnFailed: string | undefined
     try {
-      child = this.spawnBash(spec)
+      child = this.spawnBash(spec, argv)
     } catch (error) {
       // No process exists; settle immediately as killed with the error text.
       const note = `spawn failed: ${error instanceof Error ? error.message : String(error)}`
@@ -361,6 +423,15 @@ export class EncodingBashExecutor extends BashExecutor {
     Object.defineProperty(proc, 'status', { get: () => status, enumerable: true })
     Object.defineProperty(proc, 'exitCode', { get: () => exitCode, enumerable: true })
     Object.defineProperty(proc, 'signal', { get: () => signal, enumerable: true })
+    // Sandbox facts ride the process handle, stamped at settlement.
+    if (confined !== undefined && policy !== undefined) {
+      const facts = {
+        mode: policy.mode,
+        denied: false,
+        ...confined.enforcement != null ? { enforcement: confined.enforcement } : {},
+      }
+      proc.sandbox = facts
+    }
     return proc
   }
 }

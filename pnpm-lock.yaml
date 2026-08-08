@@ -11,6 +11,9 @@ importers:
       '@deepseek-ai/dsh-bash':
         specifier: link:../.dsh/source/current/packages/bash/bash
         version: link:../.dsh/source/current/packages/bash/bash
+      '@deepseek-ai/dsh-sandbox':
+        specifier: link:../.dsh/source/current/packages/sandbox/sandbox
+        version: link:../.dsh/source/current/packages/sandbox/sandbox
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.1
