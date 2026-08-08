@@ -44,6 +44,33 @@ const UTF16BE_BOM = [0xfe, 0xff] as const
 const REPLACEMENT = '\ufffd'
 
 /**
+ * Whether the buffer contains only ASCII printable (0x20..0x7E) and control
+ * (0x00..0x1F, 0x7F) bytes — i.e. no high bytes at all. Such text is UTF-8
+ * by construction; UTF-16 would interleave NUL bytes into a different
+ * pattern and the CJK heuristics cannot separate ASCII letters from UTF-16
+ * CJK low bytes.
+ */
+function isPureAscii(buffer: Buffer): boolean {
+  for (let i = 0; i < buffer.length; i++) {
+    const b = buffer[i]
+    if (b > 0x7f) return false
+  }
+  return true
+}
+
+/**
+ * A CJK high-byte hit for UTF-16: the byte is in 0x4E..0x9F. The low byte
+ * is NOT constrained here — UTF-16 CJK low bytes are arbitrary and may be
+ * printable ASCII (e.g. 个 = U+4E2A has low byte 0x2A '*'). Plain-ASCII
+ * lookalikes are excluded at the aggregate level instead: ASCII letters put
+ * BOTH parities in the range, so the high side must dominate by a margin.
+ * @param highByte - the code unit's high byte (odd offset for LE).
+ */
+function isCjkHighByte(highByte: number): boolean {
+  return highByte >= 0x4e && highByte <= 0x9f
+}
+
+/**
  * Strict UTF-8 validation: any invalid sequence (including lone continuation
  * bytes and overlong forms) throws. Used as a positive check only — every
  * valid UTF-8 stream passes, so the `catch` names the single failure mode.
@@ -107,8 +134,8 @@ function detectUtf16ByCjkHighBytes(buffer: Buffer): 'utf-16le' | 'utf-16be' | nu
   for (let i = 0; i < limit; i += 2) {
     const b0 = buffer[i]
     const b1 = buffer[i + 1]
-    if (b1 >= 0x4e && b1 <= 0x9f) oddCjk++ // odd offset = high byte in LE
-    if (b0 >= 0x4e && b0 <= 0x9f) evenCjk++ // even offset = high byte in BE
+    if (isCjkHighByte(b1)) oddCjk++ // odd offset = high byte in LE
+    if (isCjkHighByte(b0)) evenCjk++ // even offset = high byte in BE
     if ((b0 >= 0xe4 && b0 <= 0xe9) || (b1 >= 0xe4 && b1 <= 0xe9)) leadBytes++
   }
   const pairs = Math.floor(limit / 2)
@@ -116,8 +143,11 @@ function detectUtf16ByCjkHighBytes(buffer: Buffer): 'utf-16le' | 'utf-16be' | nu
   const oddRatio = oddCjk / pairs
   const evenRatio = evenCjk / pairs
   if (leadBytes > 0) return null // UTF-8 lead signature; not UTF-16
-  if (oddRatio >= 0.6 && evenRatio <= 0.55) return 'utf-16le'
-  if (evenRatio >= 0.6 && oddRatio <= 0.55) return 'utf-16be'
+  // The high side must dominate by a margin: plain ASCII letters hit BOTH
+  // sides (e.g. `hello` ≈ 1.0/1.0, difference ≈ 0), while UTF-16 CJK
+  // concentrates high bytes on one side (low bytes are arbitrary).
+  if (oddRatio >= 0.6 && oddRatio - evenRatio >= 0.25) return 'utf-16le'
+  if (evenRatio >= 0.6 && evenRatio - oddRatio >= 0.25) return 'utf-16be'
   return null
 }
 
@@ -147,6 +177,10 @@ export function detectEncoding(buffer: Buffer): DetectedEncoding {
   }
   if (buffer.length >= 2 && buffer[0] === UTF16LE_BOM[0] && buffer[1] === UTF16LE_BOM[1]) return 'utf-16le'
   if (buffer.length >= 2 && buffer[0] === UTF16BE_BOM[0] && buffer[1] === UTF16BE_BOM[1]) return 'utf-16be'
+  // Pure ASCII (printable + control bytes only) is UTF-8 by construction:
+  // UTF-16 would interleave NULs, and the CJK high-byte heuristics cannot
+  // reliably separate ASCII letters from UTF-16 CJK code units.
+  if (isPureAscii(buffer)) return 'utf-8'
   const utf16 = detectUtf16ByNuls(buffer) ?? detectUtf16ByCjkHighBytes(buffer)
   if (utf16 !== null) return utf16
   if (isStrictUtf8(buffer)) return 'utf-8'
@@ -376,17 +410,23 @@ function findUtf16Segment(
     for (let u = 0; u < anchorUnits; u++) {
       const off = from + u * 2
       const highByte = nulParity === 1 ? buffer[off + 1] : buffer[off]
-      const otherByte = nulParity === 1 ? buffer[off] : buffer[off + 1]
+      const lowByte = nulParity === 1 ? buffer[off] : buffer[off + 1]
       if (highByte === 0) anchorNuls++
-      else if (highByte >= 0x4e && highByte <= 0x9f) anchorCjk++
-      if (otherByte >= 0x4e && otherByte <= 0x9f) anchorLow++
-      if ((otherByte >= 0xe4 && otherByte <= 0xe9) || (highByte >= 0xe4 && highByte <= 0xe9)) anchorLead++
+      else if (isCjkHighByte(highByte)) anchorCjk++
+      if (isCjkHighByte(lowByte)) anchorLow++
+      if ((lowByte >= 0xe4 && lowByte <= 0xe9) || (highByte >= 0xe4 && highByte <= 0xe9)) anchorLead++
     }
     const hasNulAnchor = anchorNuls >= 3
-    // A CJK anchor needs the high side to dominate while the low side stays
-    // low (plain ASCII letters hit both sides), with no UTF-8 lead bytes.
-    const hasCjkAnchor = anchorCjk / anchorUnits >= 0.6
-      && anchorLow / anchorUnits <= 0.55
+    // Pure-ASCII windows are never UTF-16 segments (UTF-16 would interleave
+    // NULs into the anchor), so skip the CJK anchor for them outright.
+    const anchorWindow = buffer.subarray(from, from + anchorUnits * 2)
+    const hasCjkAnchor = !isPureAscii(anchorWindow)
+      && anchorCjk / anchorUnits >= 0.6
+      // Low bytes of UTF-16 CJK code units frequently land in 0x4E..0x9F,
+      // so no margin is required beyond the high side reaching a majority;
+      // pure-ASCII windows are excluded above, UTF-8 is excluded by the
+      // lead-byte check, and GBK bytes never hit the range at all.
+      && anchorCjk >= anchorLow
       && anchorLead === 0
     if (!hasNulAnchor && !hasCjkAnchor) continue
     // Extend code unit by code unit; end at a run of non-UTF16 units
@@ -394,31 +434,54 @@ function findUtf16Segment(
     // offset UTF-8 lead byte (0xE4..0xE9), which UTF-16 never produces.
     let end = from + anchorUnits * 2
     let misses = 0
+    // The segment ends at the LAST HIT: miss code units are not part of the
+    // UTF-16 segment and must not be decoded as UTF-16.
+    let lastHitEnd = end
     while (end + 1 < limit) {
       const b0 = buffer[end]
       const b1 = buffer[end + 1]
-      // UTF-16LE: the HIGH byte (odd offset) is NUL for ASCII or in the CJK
-      // range for Chinese. The low byte (even offset) is arbitrary and must
-      // NOT count as a hit — UTF-8 CJK bytes at even offsets would fake it.
+      // UTF-16LE: the HIGH byte (odd offset) is NUL for ASCII or a CJK high
+      // byte for Chinese. A printable-ASCII high byte (0x20..0x7E) is NOT a
+      // hit — a real UTF-16 ASCII code unit is `XX 00`, so a bare ASCII
+      // byte at the high position means plain ASCII text (e.g. `STDERR`),
+      // which would otherwise alternate hit/miss and never accumulate misses.
       const highByte = nulParity === 1 ? b1 : b0
-      const hit = highByte === 0 || (highByte >= 0x4e && highByte <= 0x9f)
+      const lowByte = nulParity === 1 ? b0 : b1
+      const asciiHigh = highByte >= 0x20 && highByte <= 0x7e
+      const hit = highByte === 0 || (isCjkHighByte(highByte) && !asciiHigh)
+      // A UTF-8 lead byte (0xE4..0xE9) at EITHER offset is a hard break:
+      // UTF-8 Chinese emits one every three bytes at whatever parity;
+      // UTF-16 never produces that value in a high byte (outside the CJK
+      // range) and only by chance in a low byte.
+      if ((b0 >= 0xe4 && b0 <= 0xe9) || (b1 >= 0xe4 && b1 <= 0xe9)) break
       if (hit) {
         misses = 0
+        end += 2
+        lastHitEnd = end
       } else {
         misses++
         if (misses >= 4) break
+        end += 2
       }
-      // UTF-8 lead-byte signature at the opposite offset ends the segment.
-      const otherByte = nulParity === 1 ? b0 : b1
-      if (otherByte >= 0xe4 && otherByte <= 0xe9) break
-      end += 2
     }
     if (end - from < 4) continue
-    // An open segment extends to the buffer end: include the odd trailing
-    // byte so decodeUtf16 can carry it to the next push as a pending tail.
-    const isOpen = end >= limit - 1
-    const segEnd = isOpen ? limit : Math.min(end, limit)
-    return { start: from, end: segEnd, encoding, isOpen }
+    // The segment ends at the last hit; miss code units belong to the next
+    // (normal) segment. OPEN only when the buffer boundary cut the segment
+    // mid-stream: ran out of bytes AND the consumed length is odd — half a
+    // code unit awaiting its pair in the next push. A segment that consumed
+    // a whole even-length run is complete; marking it open would make
+    // pushNormal swallow the remaining content until the next push.
+    const segEnd = Math.min(lastHitEnd, limit)
+    if (segEnd - from < 4) continue
+    // OPEN only when the buffer boundary cut the segment mid-stream: the
+    // segment consumed everything up to the buffer end AND the buffer ends
+    // with an odd trailing byte — half a code unit awaiting its pair in the
+    // next push. (lastHitEnd counts whole code units, so the odd byte is
+    // invisible to it; the buffer's own odd length is the signal.)
+    const ranOut = lastHitEnd >= limit - 1
+    const oddTail = (limit - from) % 2 === 1
+    const isOpen = ranOut && oddTail
+    return { start: from, end: isOpen ? limit : segEnd, encoding, isOpen }
   }
   return undefined
 }
@@ -437,26 +500,52 @@ function utf16SegmentEnd(
   let end = 0
   const limit = buffer.length
   let misses = 0
+  let lastHitEnd = 0
   while (end + 1 < limit) {
     const b0 = buffer[end]
     const b1 = buffer[end + 1]
     const highByte = nulParity === 1 ? b1 : b0
-    const hit = highByte === 0 || (highByte >= 0x4e && highByte <= 0x9f)
-    // The UTF-8 lead-byte signature at the opposite offset is a hard break:
-    // UTF-8 Chinese emits 0xE4..0xE9 every three bytes; UTF-16 never does.
-    const otherByte = nulParity === 1 ? b0 : b1
-    if (otherByte >= 0xe4 && otherByte <= 0xe9) break
+    const lowByte = nulParity === 1 ? b0 : b1
+    const asciiHigh = highByte >= 0x20 && highByte <= 0x7e
+    const hit = highByte === 0 || (isCjkHighByte(highByte) && !asciiHigh)
+    // A UTF-8 lead byte (0xE4..0xE9) at EITHER offset is a hard break: UTF-8
+    // Chinese emits one every three bytes at whatever parity; UTF-16 never
+    // produces that value in a high byte (outside the CJK range) and only by
+    // chance in a low byte.
+    if ((b0 >= 0xe4 && b0 <= 0xe9) || (b1 >= 0xe4 && b1 <= 0xe9)) break
     if (hit) {
       misses = 0
+      end += 2
+      lastHitEnd = end
     } else {
       // Punctuation code units (e.g. ，。！) have high bytes outside the CJK
       // range; allow short runs of them inside the segment.
       misses++
       if (misses >= 4) break
+      end += 2
     }
-    end += 2
   }
-  const isOpen = end >= limit - 1
+  // The segment ends at the last hit; miss code units belong to the next
+  // (normal) segment.
+  let segEnd = Math.min(lastHitEnd, limit)
+  // Sticky-continuation trust: a short buffer (up to 2 code units) that
+  // follows an open UTF-16 segment is almost certainly its continuation —
+  // its code units may be CJK characters whose high byte happens to fall in
+  // the printable-ASCII range (e.g. 息 = 0x606F, high byte 0x60 = '`'), which
+  // the asciiHigh guard would otherwise reject. Only a UTF-8 lead byte can
+  // veto this.
+  if (segEnd === 0 && limit >= 2 && limit <= 4) {
+    let hasLead = false
+    for (let i = 0; i + 1 < limit; i += 2) {
+      if ((buffer[i] >= 0xe4 && buffer[i] <= 0xe9) || (buffer[i + 1] >= 0xe4 && buffer[i + 1] <= 0xe9)) hasLead = true
+    }
+    if (!hasLead) segEnd = limit
+  }
+  // Open iff the buffer boundary cut the segment mid-stream: ran out of
+  // bytes AND the buffer ends with an odd trailing byte (half a code unit).
+  const ranOut = segEnd >= limit - 1
+  const oddTail = limit % 2 === 1
+  const isOpen = ranOut && oddTail
   // Include the odd trailing byte so the caller can carry it as a pending tail.
-  return { end: isOpen ? limit : Math.min(end, limit), isOpen }
+  return { end: isOpen ? limit : segEnd, isOpen }
 }
