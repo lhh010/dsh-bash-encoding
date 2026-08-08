@@ -7,13 +7,21 @@
  * unrecoverable mojibake (`�hKm0R …`). This module re-decodes the raw bytes
  * this plugin captures itself, before any lossy conversion happens.
  *
- * Detection order:
+ * Detection order (per chunk):
  * 1. BOM (UTF-8 / UTF-16LE / UTF-16BE).
  * 2. NUL-byte parity heuristic for BOM-less UTF-16.
  * 3. Strict UTF-8 validation (fatal decoder).
  * 4. GBK, then GB18030, as the CJK legacy fallback (Windows OEM codepages
  *    936/54936 for Chinese tools).
  * 5. Latin-1 as the last resort (never fails; better than mojibake).
+ *
+ * Chunk-level streaming: a real child stream can interleave encodings —
+ * wsl.exe writes its UTF-16LE proxy warning as one complete write, then the
+ * command's own UTF-8 output follows on the same pipe. Detecting the whole
+ * concatenated stream as one encoding mangles whichever part is in the other
+ * encoding, so {@link ChunkDecoder} detects each pipe write independently,
+ * keeps UTF-8 multi-byte state across chunks via `{ stream: true }`, and
+ * carries an odd UTF-16 trailing byte to the next chunk for pairing.
  *
  * @module @dsh-external/dsh-bash-encoding/decode-core
  */
@@ -59,7 +67,7 @@ function detectUtf16ByNuls(buffer: Buffer): 'utf-16le' | 'utf-16be' | null {
   let evenNuls = 0
   let oddNuls = 0
   // Sample the first 256 bytes; a full scan is unnecessary for a heuristic.
-  const limit = Math.min(buffer.length, 256)
+  const limit = Math.min(buffer.length & ~1, 256)
   for (let i = 0; i < limit; i++) {
     if (buffer[i] === 0) {
       if (i % 2 === 0) evenNuls++
@@ -79,10 +87,19 @@ function detectUtf16ByNuls(buffer: Buffer): 'utf-16le' | 'utf-16be' | null {
  * that high byte sits at even offsets. Pure-CJK UTF-16 streams carry no NUL
  * bytes, so this distribution heuristic catches what the NUL parity misses.
  * Returns `'utf-16le' | 'utf-16be' | null`.
+ *
+ * Only ONE side needs the high-byte majority: the low byte of a UTF-16 code
+ * unit is arbitrary and may itself land in 0x4E..0x9F, so a cross-side cap
+ * would reject valid streams. GBK lead/trail bytes (0xB0..0xF7 / 0xA1..0xFE)
+ * and UTF-8 lead bytes (0xE4..0xE9) all fall outside the range, so a 0.6
+ * majority on one side is a strong UTF-16 signature; when both sides reach
+ * it the stream is ambiguous and null is returned (rare).
  */
 function detectUtf16ByCjkHighBytes(buffer: Buffer): 'utf-16le' | 'utf-16be' | null {
   if (buffer.length < 8) return null
-  const limit = Math.min(buffer.length, 256)
+  // Only whole code units are scored: an odd trailing byte must not count its
+  // lone byte as a low byte (it would skew the even-side ratio).
+  const limit = Math.min(buffer.length & ~1, 256)
   let oddCjk = 0
   let evenCjk = 0
   for (let i = 0; i < limit; i += 2) {
@@ -95,11 +112,8 @@ function detectUtf16ByCjkHighBytes(buffer: Buffer): 'utf-16le' | 'utf-16be' | nu
   if (pairs === 0) return null
   const oddRatio = oddCjk / pairs
   const evenRatio = evenCjk / pairs
-  // A clear majority of code units carrying a CJK high byte on one side
-  // (and not on the other) is a strong UTF-16 signature; GBK lead bytes
-  // (0xB0..0xF7) and UTF-8 lead bytes (0xE4..0xE9) both fall outside it.
-  if (oddRatio >= 0.6 && evenRatio <= 0.2) return 'utf-16le'
-  if (evenRatio >= 0.6 && oddRatio <= 0.2) return 'utf-16be'
+  if (oddRatio >= 0.6 && evenRatio < 0.6) return 'utf-16le'
+  if (evenRatio >= 0.6 && oddRatio < 0.6) return 'utf-16be'
   return null
 }
 
@@ -116,7 +130,9 @@ function tryLegacyDecode(buffer: Buffer, encoding: 'gbk' | 'gb18030'): string | 
 }
 
 /**
- * Detect the encoding of a raw byte stream.
+ * Detect the encoding of one raw byte chunk. Chunk-level, not stream-level:
+ * a chunk is assumed to be a single pipe write, which is the granularity at
+ * which wsl.exe emits its UTF-16LE warning vs. the command's UTF-8 output.
  * @param buffer - raw captured bytes (may be empty).
  * @returns the detected encoding.
  */
@@ -137,31 +153,148 @@ export function detectEncoding(buffer: Buffer): DetectedEncoding {
   return 'gb18030'
 }
 
+/** Strip a leading BOM from the buffer for the matching encoding. */
+function stripBom(buffer: Buffer, encoding: DetectedEncoding): Buffer {
+  if (encoding === 'utf-8' && buffer.length >= 3 && buffer[0] === UTF8_BOM[0] && buffer[1] === UTF8_BOM[1] && buffer[2] === UTF8_BOM[2]) {
+    return buffer.subarray(3)
+  }
+  if ((encoding === 'utf-16le' || encoding === 'utf-16be') && buffer.length >= 2
+    && ((buffer[0] === 0xff && buffer[1] === 0xfe) || (buffer[0] === 0xfe && buffer[1] === 0xff))) {
+    return buffer.subarray(2)
+  }
+  return buffer
+}
+
 /**
- * Decode a raw byte stream with automatic encoding detection.
+ * Decode one complete byte chunk with automatic encoding detection.
  * @param buffer - raw captured bytes.
  * @returns the decoded text and the encoding that produced it.
  */
 export function decodeBuffer(buffer: Buffer): DecodeResult {
   const encoding = detectEncoding(buffer)
-  if (encoding === 'utf-8') {
-    // Strip a BOM if present; TextDecoder keeps it in the output.
-    const body = buffer.length >= 3 && buffer[0] === UTF8_BOM[0] && buffer[1] === UTF8_BOM[1] && buffer[2] === UTF8_BOM[2]
-      ? buffer.subarray(3)
-      : buffer
-    return { text: new TextDecoder('utf-8').decode(body), encoding }
-  }
+  return { text: decodeChunkBody(buffer, encoding), encoding }
+}
+
+/** Decode one chunk body after detection; the shared tail of decodeBuffer and ChunkDecoder. */
+function decodeChunkBody(buffer: Buffer, encoding: DetectedEncoding): string {
+  const body = stripBom(buffer, encoding)
+  if (encoding === 'utf-8') return new TextDecoder('utf-8').decode(body)
   if (encoding === 'utf-16le' || encoding === 'utf-16be') {
-    const bom = buffer.length >= 2 && ((buffer[0] === 0xff && buffer[1] === 0xfe) || (buffer[0] === 0xfe && buffer[1] === 0xff))
-    let body = bom ? buffer.subarray(2) : buffer
     // A trailing odd byte is half a code unit (e.g. a lone `\n` appended after
     // a UTF-16 stream); drop it instead of emitting U+FFFD.
-    if (body.length % 2 !== 0) body = body.subarray(0, body.length - 1)
-    return { text: new TextDecoder(encoding).decode(body), encoding }
+    const trimmed = body.length % 2 !== 0 ? body.subarray(0, body.length - 1) : body
+    return new TextDecoder(encoding).decode(trimmed)
   }
   if (encoding === 'gbk' || encoding === 'gb18030') {
-    const text = tryLegacyDecode(buffer, encoding)
-    if (text !== null) return { text, encoding }
+    const text = tryLegacyDecode(body, encoding)
+    if (text !== null) return text
   }
-  return { text: buffer.toString('latin1'), encoding: 'latin1' }
+  return body.toString('latin1')
+}
+
+/**
+ * Streaming decoder for an interleaved-encoding child stream. One instance
+ * per captured stream; feed raw pipe chunks with {@link ChunkDecoder.push}
+ * and read the accumulated text with {@link ChunkDecoder.text}.
+ *
+ * Cross-chunk state:
+ * - UTF-8 multi-byte sequences: kept by a `{ stream: true }` TextDecoder, so
+ *   a character split across pipe writes reassembles without U+FFFD.
+ * - UTF-16 odd trailing byte: retained and prepended to the next chunk when
+ *   that chunk also detects as UTF-16; dropped when the next chunk is not
+ *   UTF-16 (it was noise, not half a code unit).
+ */
+export class ChunkDecoder {
+  /**
+   * Streaming UTF-8 decoder; carries incomplete sequences across chunks.
+   * `stream: true` is a WHATWG TextDecoder option; the bundled @types/node
+   * labels it narrowly, so the cast documents runtime support.
+   */
+  private readonly utf8 = new TextDecoder('utf-8', { stream: true } as unknown as { fatal?: boolean; ignoreBOM?: boolean; stream?: boolean })
+  /** An odd UTF-16 trailing byte awaiting its pair in the next chunk. */
+  private pendingUtf16Tail: Buffer | undefined
+  /**
+   * Sticky UTF-16 mode: once a stream detects as UTF-16 (wsl.exe's warning),
+   * later chunks are decoded as UTF-16 until a chunk provides strong evidence
+   * of another encoding (strict UTF-8 with a low NUL ratio). A long UTF-16
+   * stream can be split across pipe writes, and each fragment alone may be
+   * too short for the detection heuristics.
+   */
+  private utf16Mode: 'utf-16le' | 'utf-16be' | undefined
+  /** Decoded output accumulated so far. */
+  private out = ''
+
+  /** Push one raw pipe chunk; appends its decoded text. */
+  push(chunk: Buffer): void {
+    if (chunk.length === 0) return
+    const effective = this.pendingUtf16Tail !== undefined
+      ? Buffer.concat([this.pendingUtf16Tail, chunk])
+      : chunk
+
+    // Sticky mode: prefer UTF-16 unless the chunk is unambiguous UTF-8.
+    if (this.utf16Mode !== undefined) {
+      // Strong exit evidence: strict UTF-8 with few NUL bytes (a UTF-16 ASCII
+      // fragment carries a NUL after every character; real UTF-8 text has none).
+      if (this.pendingUtf16Tail === undefined && isStrictUtf8(chunk) && nulRatio(chunk) < 0.1) {
+        this.utf16Mode = undefined
+        this.out += this.utf8.decode(chunk)
+        return
+      }
+      this.pendingUtf16Tail = undefined
+      const body = stripBom(effective, this.utf16Mode)
+      const odd = body.length % 2 !== 0
+      const complete = odd ? body.subarray(0, body.length - 1) : body
+      if (odd) this.pendingUtf16Tail = Buffer.from([body[body.length - 1]])
+      this.out += new TextDecoder(this.utf16Mode).decode(complete)
+      return
+    }
+
+    const encoding = detectEncoding(effective)
+    if (encoding === 'utf-16le' || encoding === 'utf-16be') {
+      this.utf16Mode = encoding
+      this.pendingUtf16Tail = undefined
+      const body = stripBom(effective, encoding)
+      // Keep an odd tail for the next chunk; decode the even prefix now.
+      const odd = body.length % 2 !== 0
+      const complete = odd ? body.subarray(0, body.length - 1) : body
+      if (odd) this.pendingUtf16Tail = Buffer.from([body[body.length - 1]])
+      this.out += new TextDecoder(encoding).decode(complete)
+      return
+    }
+    // Not UTF-16: the pending tail, if any, was noise — drop it and decode
+    // the current chunk as-is. UTF-8 streams carry their own cross-chunk state.
+    this.pendingUtf16Tail = undefined
+    if (encoding === 'utf-8') {
+      this.out += this.utf8.decode(chunk)
+      return
+    }
+    if (encoding === 'gbk' || encoding === 'gb18030') {
+      const text = tryLegacyDecode(chunk, encoding)
+      this.out += text ?? chunk.toString('latin1')
+      return
+    }
+    this.out += chunk.toString('latin1')
+  }
+
+  /** Flush trailing decoder state (call once when the stream closes). */
+  flush(): void {
+    this.out += this.utf8.decode()
+    this.pendingUtf16Tail = undefined
+    this.utf16Mode = undefined
+  }
+
+  /** The decoded text accumulated so far. */
+  get text(): string {
+    return this.out
+  }
+}
+
+/** Fraction of NUL bytes in the chunk (0..1). */
+function nulRatio(buffer: Buffer): number {
+  if (buffer.length === 0) return 0
+  let nuls = 0
+  for (let i = 0; i < buffer.length; i++) {
+    if (buffer[i] === 0) nuls++
+  }
+  return nuls / buffer.length
 }

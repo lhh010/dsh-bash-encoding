@@ -32,7 +32,7 @@ import type {
   CollectedOutput,
 } from '@deepseek-ai/dsh-bash'
 import type { SandboxEnforcement, SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
-import { decodeBuffer } from './decode-core.js'
+import { ChunkDecoder } from './decode-core.js'
 
 /** Model-friendly terminal overrides, mirroring `dsh-bash-local`. */
 const ENV_OVERRIDES = {
@@ -60,13 +60,17 @@ const CREDENTIAL_MARKERS = ['KEY', 'PASSWORD', 'SECRET', 'TOKEN']
 /** Ambient `DSH_*` variables are scrubbed; managed facts arrive via `dshEnv`. */
 const DSH_PREFIX = 'DSH_'
 
-/** A captured byte stream: raw chunks plus the final byte count. Decoding
- * happens once at read time so incremental readers see consistent text.
+/**
+ * A captured byte stream: raw chunks (for byte accounting and lossiness) plus
+ * a chunk-level streaming decoder that reassembles interleaved encodings
+ * (wsl.exe's UTF-16LE warning write, then the command's UTF-8 output).
  */
 interface ByteStream {
   chunks: Buffer[]
   bytes: number
   capped: boolean
+  /** Streaming decoder; decoded text accumulates incrementally. */
+  decoder: ChunkDecoder
 }
 
 /** Confinement facts retained from a `ctx.sandbox.confine` wrap. */
@@ -105,26 +109,18 @@ function scrubAmbient(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return clean
 }
 
-/** Per-stream append with a byte cap: keep the head, drop the overflow, flag lossy. */
+/** Per-stream append with a byte cap: keep the head, drop the overflow, flag lossy, decode incrementally. */
 function appendChunk(stream: ByteStream, chunk: Buffer, cap: number): void {
   const room = cap - stream.bytes
   if (room <= 0) {
     stream.capped = true
     return
   }
-  if (chunk.length <= room) {
-    stream.chunks.push(chunk)
-    stream.bytes += chunk.length
-    return
-  }
-  stream.chunks.push(chunk.subarray(0, room))
-  stream.bytes += room
-  stream.capped = true
-}
-
-/** Concatenate the captured head bytes. */
-function concatHead(stream: ByteStream): Buffer {
-  return Buffer.concat(stream.chunks, stream.bytes)
+  const kept = chunk.length <= room ? chunk : chunk.subarray(0, room)
+  stream.chunks.push(kept)
+  stream.bytes += kept.length
+  stream.decoder.push(kept)
+  if (kept.length < chunk.length) stream.capped = true
 }
 
 /**
@@ -143,19 +139,21 @@ export class EncodingBashExecutor extends BashExecutor {
   /** Validated config (schemastery filled defaults before construction). */
   readonly config: ResolvedConfig
 
-  /** The resolved default mode, when a sandbox policy service is present. */
-  private readonly defaultMode: SandboxMode | undefined
-
   constructor(ctx: import('cordis').Context, config: EncodingBashConfig) {
     super(ctx)
     this.config = config as ResolvedConfig
-    const policy = ctx.get('sandboxPolicy')
-    this.defaultMode = policy?.defaultMode
+    // sandboxMode is resolved lazily in the getter, not cached here: this
+    // executor declares no inject dependency on sandboxPolicy (so it also runs
+    // in non-confining compositions), but sandboxPolicy may register only
+    // after this executor constructs. Consumers that read sandboxMode
+    // (permission, tool-bash) inject services that settle later, so by the
+    // time they look the sandbox infrastructure is up and the lazy lookup is
+    // non-null — reading it eagerly in the constructor raced and read undefined.
   }
 
   /** The default mode when the sandbox policy service is present, else undefined. */
   override get sandboxMode(): SandboxMode | undefined {
-    return this.defaultMode
+    return this.ctx.get('sandboxPolicy')?.defaultMode
   }
 
   /**
@@ -245,8 +243,8 @@ export class EncodingBashExecutor extends BashExecutor {
    * fused timeout/abort deadline, and settle into a {@link BashRunResult}.
    */
   async run(spec: BashExecSpec): Promise<BashRunResult> {
-    const stdout: ByteStream = { chunks: [], bytes: 0, capped: false }
-    const stderr: ByteStream = { chunks: [], bytes: 0, capped: false }
+    const stdout: ByteStream = { chunks: [], bytes: 0, capped: false, decoder: new ChunkDecoder() }
+    const stderr: ByteStream = { chunks: [], bytes: 0, capped: false, decoder: new ChunkDecoder() }
     const stdoutCap = spec.stdoutMaxBytes
     const stderrCap = this.config.maxOutputBytes
 
@@ -313,13 +311,13 @@ export class EncodingBashExecutor extends BashExecutor {
     spec.signal?.removeEventListener('abort', onAbort)
 
     const finalize = (stream: ByteStream): CollectedOutput => ({
-      text: decodeBuffer(concatHead(stream)).text,
+      text: stream.decoder.text,
       truncated: stream.capped,
     })
     // A spawn failure carries no process output; the error text is the stderr.
     const stderrText = spawnError !== undefined
       ? `${spawnError}\n`
-      : decodeBuffer(concatHead(stderr)).text
+      : stderr.decoder.text
     const sandbox = confined !== undefined && policy !== undefined
       ? {
           mode: policy.mode,
@@ -340,8 +338,8 @@ export class EncodingBashExecutor extends BashExecutor {
 
   /** Start a background process; output stays buffered and readable after exit. */
   start(spec: BashExecSpec): BashProcess {
-    const stdout: ByteStream = { chunks: [], bytes: 0, capped: false }
-    const stderr: ByteStream = { chunks: [], bytes: 0, capped: false }
+    const stdout: ByteStream = { chunks: [], bytes: 0, capped: false, decoder: new ChunkDecoder() }
+    const stderr: ByteStream = { chunks: [], bytes: 0, capped: false, decoder: new ChunkDecoder() }
     const cap = this.config.maxOutputBytes
 
     const { argv, confined } = this.resolveArgv(spec)
@@ -397,8 +395,8 @@ export class EncodingBashExecutor extends BashExecutor {
       signal: null,
       done,
       readOutput: (): BashProcessRead => {
-        const out = decodeBuffer(concatHead(stdout)).text
-        const err = decodeBuffer(concatHead(stderr)).text
+        const out = stdout.decoder.text
+        const err = stderr.decoder.text
         const deltaOut = out.slice(stdoutRead)
         const deltaErr = err.slice(stderrRead)
         stdoutRead = out.length
