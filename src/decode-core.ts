@@ -88,12 +88,13 @@ function detectUtf16ByNuls(buffer: Buffer): 'utf-16le' | 'utf-16be' | null {
  * bytes, so this distribution heuristic catches what the NUL parity misses.
  * Returns `'utf-16le' | 'utf-16be' | null`.
  *
- * Only ONE side needs the high-byte majority: the low byte of a UTF-16 code
- * unit is arbitrary and may itself land in 0x4E..0x9F, so a cross-side cap
- * would reject valid streams. GBK lead/trail bytes (0xB0..0xF7 / 0xA1..0xFE)
- * and UTF-8 lead bytes (0xE4..0xE9) all fall outside the range, so a 0.6
- * majority on one side is a strong UTF-16 signature; when both sides reach
- * it the stream is ambiguous and null is returned (rare).
+ * Three guards separate UTF-16 from lookalikes:
+ * - The high side must dominate (>= 0.6) while the low side stays low
+ *   (<= 0.55): plain ASCII letters hit BOTH sides (e.g. `hello` = 1.0/1.0),
+ *   so a high-side majority alone is not a UTF-16 signature.
+ * - UTF-8 lead bytes (0xE4..0xE9) anywhere disqualify the stream: UTF-8
+ *   Chinese emits one every three bytes, UTF-16 never does.
+ * - GBK lead/trail bytes (0xB0..0xF7 / 0xA1..0xFE) never hit the range.
  */
 function detectUtf16ByCjkHighBytes(buffer: Buffer): 'utf-16le' | 'utf-16be' | null {
   if (buffer.length < 8) return null
@@ -102,18 +103,21 @@ function detectUtf16ByCjkHighBytes(buffer: Buffer): 'utf-16le' | 'utf-16be' | nu
   const limit = Math.min(buffer.length & ~1, 256)
   let oddCjk = 0
   let evenCjk = 0
+  let leadBytes = 0
   for (let i = 0; i < limit; i += 2) {
     const b0 = buffer[i]
     const b1 = buffer[i + 1]
     if (b1 >= 0x4e && b1 <= 0x9f) oddCjk++ // odd offset = high byte in LE
     if (b0 >= 0x4e && b0 <= 0x9f) evenCjk++ // even offset = high byte in BE
+    if ((b0 >= 0xe4 && b0 <= 0xe9) || (b1 >= 0xe4 && b1 <= 0xe9)) leadBytes++
   }
   const pairs = Math.floor(limit / 2)
   if (pairs === 0) return null
   const oddRatio = oddCjk / pairs
   const evenRatio = evenCjk / pairs
-  if (oddRatio >= 0.6 && evenRatio < 0.6) return 'utf-16le'
-  if (evenRatio >= 0.6 && oddRatio < 0.6) return 'utf-16be'
+  if (leadBytes > 0) return null // UTF-8 lead signature; not UTF-16
+  if (oddRatio >= 0.6 && evenRatio <= 0.55) return 'utf-16le'
+  if (evenRatio >= 0.6 && oddRatio <= 0.55) return 'utf-16be'
   return null
 }
 
@@ -197,12 +201,25 @@ function decodeChunkBody(buffer: Buffer, encoding: DetectedEncoding): string {
  * per captured stream; feed raw pipe chunks with {@link ChunkDecoder.push}
  * and read the accumulated text with {@link ChunkDecoder.text}.
  *
+ * A pipe write may merge encodings into ONE chunk: wsl.exe's UTF-16LE warning
+ * and the command's UTF-8 output frequently arrive in the same read, so
+ * per-chunk detection alone is insufficient. The decoder therefore scans
+ * WITHIN each effective buffer for encoding segments:
+ *
+ * - A UTF-16 segment is anchored by its ASCII portion: in UTF-16LE every
+ *   ASCII code unit is `XX 00` (NUL at odd offsets); in UTF-16BE `00 XX`
+ *   (NUL at even offsets). Dense odd/even NUL runs mark the segment's
+ *   start, and the segment extends while the NUL pattern (or pure-CJK
+ *   high-byte pattern) holds.
+ * - The remainder of the buffer is decoded as a normal (UTF-8/GBK) segment.
+ *
  * Cross-chunk state:
  * - UTF-8 multi-byte sequences: kept by a `{ stream: true }` TextDecoder, so
  *   a character split across pipe writes reassembles without U+FFFD.
  * - UTF-16 odd trailing byte: retained and prepended to the next chunk when
- *   that chunk also detects as UTF-16; dropped when the next chunk is not
- *   UTF-16 (it was noise, not half a code unit).
+ *   that chunk still begins with UTF-16; dropped otherwise.
+ * - A UTF-16 segment cut by the chunk boundary is finished in the next push
+ *   via the sticky UTF-16 mode.
  */
 export class ChunkDecoder {
   /**
@@ -214,11 +231,9 @@ export class ChunkDecoder {
   /** An odd UTF-16 trailing byte awaiting its pair in the next chunk. */
   private pendingUtf16Tail: Buffer | undefined
   /**
-   * Sticky UTF-16 mode: once a stream detects as UTF-16 (wsl.exe's warning),
-   * later chunks are decoded as UTF-16 until a chunk provides strong evidence
-   * of another encoding (strict UTF-8 with a low NUL ratio). A long UTF-16
-   * stream can be split across pipe writes, and each fragment alone may be
-   * too short for the detection heuristics.
+   * Sticky UTF-16 mode: once a UTF-16 segment is open (its final byte may
+   * have been cut by the chunk boundary), the next push continues it until
+   * strong evidence of another encoding appears.
    */
   private utf16Mode: 'utf-16le' | 'utf-16be' | undefined
   /** Decoded output accumulated so far. */
@@ -231,49 +246,72 @@ export class ChunkDecoder {
       ? Buffer.concat([this.pendingUtf16Tail, chunk])
       : chunk
 
-    // Sticky mode: prefer UTF-16 unless the chunk is unambiguous UTF-8.
+    // Sticky UTF-16 continuation: the previous push ended mid-segment.
     if (this.utf16Mode !== undefined) {
-      // Strong exit evidence: strict UTF-8 with few NUL bytes (a UTF-16 ASCII
-      // fragment carries a NUL after every character; real UTF-8 text has none).
-      if (this.pendingUtf16Tail === undefined && isStrictUtf8(chunk) && nulRatio(chunk) < 0.1) {
-        this.utf16Mode = undefined
-        this.out += this.utf8.decode(chunk)
+      const encoding = this.utf16Mode
+      // Find where the UTF-16 pattern breaks inside this buffer.
+      const seg = utf16SegmentEnd(effective, encoding, 0, true)
+      const { end, isOpen } = seg
+      this.decodeUtf16(effective.subarray(0, end), encoding)
+      if (isOpen) {
+        // The whole buffer is still UTF-16; keep the mode (and possibly a tail).
         return
       }
-      this.pendingUtf16Tail = undefined
-      const body = stripBom(effective, this.utf16Mode)
-      const odd = body.length % 2 !== 0
-      const complete = odd ? body.subarray(0, body.length - 1) : body
-      if (odd) this.pendingUtf16Tail = Buffer.from([body[body.length - 1]])
-      this.out += new TextDecoder(this.utf16Mode).decode(complete)
+      this.utf16Mode = undefined
+      // The remainder is a normal segment; fall through to segment scan.
+      const rest = effective.subarray(end)
+      if (rest.length > 0) this.pushNormal(rest)
       return
     }
 
-    const encoding = detectEncoding(effective)
-    if (encoding === 'utf-16le' || encoding === 'utf-16be') {
-      this.utf16Mode = encoding
-      this.pendingUtf16Tail = undefined
-      const body = stripBom(effective, encoding)
-      // Keep an odd tail for the next chunk; decode the even prefix now.
-      const odd = body.length % 2 !== 0
-      const complete = odd ? body.subarray(0, body.length - 1) : body
-      if (odd) this.pendingUtf16Tail = Buffer.from([body[body.length - 1]])
-      this.out += new TextDecoder(encoding).decode(complete)
-      return
+    this.pushNormal(effective)
+  }
+
+  /** Decode one buffer that may interleave a UTF-16 segment and normal text. */
+  private pushNormal(buffer: Buffer): void {
+    let pos = 0
+    while (pos < buffer.length) {
+      const seg = findUtf16Segment(buffer, pos)
+      if (seg === undefined) break
+      const { start, end, encoding, isOpen } = seg
+      // Text before the segment start is a normal segment.
+      if (start > pos) this.decodeNormal(buffer.subarray(pos, start))
+      this.decodeUtf16(buffer.subarray(start, end), encoding)
+      if (isOpen) {
+        this.utf16Mode = encoding
+        return
+      }
+      pos = end
     }
-    // Not UTF-16: the pending tail, if any, was noise — drop it and decode
-    // the current chunk as-is. UTF-8 streams carry their own cross-chunk state.
+    // Trailing text after the last segment (or the whole buffer).
+    this.decodeNormal(buffer.subarray(pos))
+  }
+
+  /** Decode a UTF-16 slice, carrying an odd trailing byte across pushes. */
+  private decodeUtf16(body: Buffer, encoding: 'utf-16le' | 'utf-16be'): void {
+    // The caller merged any carried tail into `body`; clear it unconditionally
+    // so a consumed tail cannot leak into the next push.
     this.pendingUtf16Tail = undefined
+    const odd = body.length % 2 !== 0
+    const complete = odd ? body.subarray(0, body.length - 1) : body
+    if (odd) this.pendingUtf16Tail = Buffer.from([body[body.length - 1]])
+    this.out += new TextDecoder(encoding).decode(complete)
+  }
+
+  /** Decode a normal (non-UTF-16) slice with encoding detection. */
+  private decodeNormal(buffer: Buffer): void {
+    if (buffer.length === 0) return
+    const encoding = detectEncoding(buffer)
     if (encoding === 'utf-8') {
-      this.out += this.utf8.decode(chunk)
+      this.out += this.utf8.decode(buffer)
       return
     }
     if (encoding === 'gbk' || encoding === 'gb18030') {
-      const text = tryLegacyDecode(chunk, encoding)
-      this.out += text ?? chunk.toString('latin1')
+      const text = tryLegacyDecode(buffer, encoding)
+      this.out += text ?? buffer.toString('latin1')
       return
     }
-    this.out += chunk.toString('latin1')
+    this.out += buffer.toString('latin1')
   }
 
   /** Flush trailing decoder state (call once when the stream closes). */
@@ -289,7 +327,7 @@ export class ChunkDecoder {
   }
 }
 
-/** Fraction of NUL bytes in the chunk (0..1). */
+/** Fraction of NUL bytes in the buffer (0..1). */
 function nulRatio(buffer: Buffer): number {
   if (buffer.length === 0) return 0
   let nuls = 0
@@ -297,4 +335,128 @@ function nulRatio(buffer: Buffer): number {
     if (buffer[i] === 0) nuls++
   }
   return nuls / buffer.length
+}
+
+/**
+ * Locate the next UTF-16 segment starting at or after `from` inside one
+ * buffer. Anchors on a dense run of parity-aligned NUL bytes (the ASCII
+ * portion of a UTF-16 stream) and extends through pure-CJK code units
+ * (high byte in 0x4E..0x9F, no NULs) and punctuation (any high byte) while
+ * the code-unit pattern holds.
+ *
+ * Termination distinguishes UTF-8 Chinese from UTF-16 Chinese: UTF-8 CJK
+ * bytes come in 3-byte groups whose odd-position bytes only sporadically
+ * fall in the CJK high range (`C..C..`), whereas UTF-16 CJK code units
+ * produce consecutive high-byte hits (`CCCC`). The segment therefore ends
+ * at the first run of two consecutive code units with no NUL and no CJK
+ * high byte — a signature UTF-8 Chinese text cannot produce.
+ * @param buffer - the buffer to scan.
+ * @param from - byte offset to start scanning at.
+ * @returns the segment's start/end offsets, its encoding, and whether the
+ * segment is open at the buffer end (cut by the chunk boundary).
+ */
+function findUtf16Segment(
+  buffer: Buffer,
+  from: number,
+): { start: number; end: number; encoding: 'utf-16le' | 'utf-16be'; isOpen: boolean } | undefined {
+  const limit = buffer.length
+  if (limit - from < 8) return undefined
+  // Try both byte orders; pick the parity with the denser anchor.
+  for (const encoding of ['utf-16le', 'utf-16be'] as const) {
+    const nulParity = encoding === 'utf-16le' ? 1 : 0
+    // Anchor: in the first 8 code units from `from`, either at least 3 NULs
+    // (ASCII UTF-16) or a 0.6 CJK-high-byte majority (pure-CJK UTF-16) with
+    // no UTF-8 lead byte (0xE4..0xE9) at the opposite offset, which UTF-8
+    // Chinese emits every three bytes and UTF-16 never does.
+    const anchorUnits = Math.min(8, Math.floor((limit - from) / 2))
+    let anchorNuls = 0
+    let anchorCjk = 0
+    let anchorLow = 0
+    let anchorLead = 0
+    for (let u = 0; u < anchorUnits; u++) {
+      const off = from + u * 2
+      const highByte = nulParity === 1 ? buffer[off + 1] : buffer[off]
+      const otherByte = nulParity === 1 ? buffer[off] : buffer[off + 1]
+      if (highByte === 0) anchorNuls++
+      else if (highByte >= 0x4e && highByte <= 0x9f) anchorCjk++
+      if (otherByte >= 0x4e && otherByte <= 0x9f) anchorLow++
+      if ((otherByte >= 0xe4 && otherByte <= 0xe9) || (highByte >= 0xe4 && highByte <= 0xe9)) anchorLead++
+    }
+    const hasNulAnchor = anchorNuls >= 3
+    // A CJK anchor needs the high side to dominate while the low side stays
+    // low (plain ASCII letters hit both sides), with no UTF-8 lead bytes.
+    const hasCjkAnchor = anchorCjk / anchorUnits >= 0.6
+      && anchorLow / anchorUnits <= 0.55
+      && anchorLead === 0
+    if (!hasNulAnchor && !hasCjkAnchor) continue
+    // Extend code unit by code unit; end at a run of non-UTF16 units
+    // (punctuation like ，。！ is allowed in short runs) or at an opposite-
+    // offset UTF-8 lead byte (0xE4..0xE9), which UTF-16 never produces.
+    let end = from + anchorUnits * 2
+    let misses = 0
+    while (end + 1 < limit) {
+      const b0 = buffer[end]
+      const b1 = buffer[end + 1]
+      // UTF-16LE: the HIGH byte (odd offset) is NUL for ASCII or in the CJK
+      // range for Chinese. The low byte (even offset) is arbitrary and must
+      // NOT count as a hit — UTF-8 CJK bytes at even offsets would fake it.
+      const highByte = nulParity === 1 ? b1 : b0
+      const hit = highByte === 0 || (highByte >= 0x4e && highByte <= 0x9f)
+      if (hit) {
+        misses = 0
+      } else {
+        misses++
+        if (misses >= 4) break
+      }
+      // UTF-8 lead-byte signature at the opposite offset ends the segment.
+      const otherByte = nulParity === 1 ? b0 : b1
+      if (otherByte >= 0xe4 && otherByte <= 0xe9) break
+      end += 2
+    }
+    if (end - from < 4) continue
+    // An open segment extends to the buffer end: include the odd trailing
+    // byte so decodeUtf16 can carry it to the next push as a pending tail.
+    const isOpen = end >= limit - 1
+    const segEnd = isOpen ? limit : Math.min(end, limit)
+    return { start: from, end: segEnd, encoding, isOpen }
+  }
+  return undefined
+}
+
+/**
+ * Extension scan for the sticky UTF-16 mode: find where the pattern breaks
+ * starting at offset 0 of the current buffer (which continues an open segment).
+ */
+function utf16SegmentEnd(
+  buffer: Buffer,
+  encoding: 'utf-16le' | 'utf-16be',
+  _from: number,
+  _requireAnchor: boolean,
+): { end: number; isOpen: boolean } {
+  const nulParity = encoding === 'utf-16le' ? 1 : 0
+  let end = 0
+  const limit = buffer.length
+  let misses = 0
+  while (end + 1 < limit) {
+    const b0 = buffer[end]
+    const b1 = buffer[end + 1]
+    const highByte = nulParity === 1 ? b1 : b0
+    const hit = highByte === 0 || (highByte >= 0x4e && highByte <= 0x9f)
+    // The UTF-8 lead-byte signature at the opposite offset is a hard break:
+    // UTF-8 Chinese emits 0xE4..0xE9 every three bytes; UTF-16 never does.
+    const otherByte = nulParity === 1 ? b0 : b1
+    if (otherByte >= 0xe4 && otherByte <= 0xe9) break
+    if (hit) {
+      misses = 0
+    } else {
+      // Punctuation code units (e.g. ，。！) have high bytes outside the CJK
+      // range; allow short runs of them inside the segment.
+      misses++
+      if (misses >= 4) break
+    }
+    end += 2
+  }
+  const isOpen = end >= limit - 1
+  // Include the odd trailing byte so the caller can carry it as a pending tail.
+  return { end: isOpen ? limit : Math.min(end, limit), isOpen }
 }
