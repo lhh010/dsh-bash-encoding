@@ -5,7 +5,13 @@ UTF-16LE / UTF-8 / GBK 等编码并正确解码，修复 Windows/WSL 下 bash �
 
 ## 版本兼容 / Version compatibility
 
-兼容 DSH snapshot0808（`snapshots/20260808T121140Z-7f25d3e98c`）：宿主侧插件，替换 `ctx.bash` 执行器，只依赖 bash 缝合线与 `ctx.sandbox`/`ctx.sandboxPolicy` 探测面——这些在 0808 上均未变化，typecheck 与实机加载已验证。
+兼容 DSH snapshot0808（`snapshots/20260808T121140Z-7f25d3e98c`）与 snapshot0809（`snapshots/20260809T140917Z-a6bb5a95ba`）：宿主侧插件，替换 `ctx.bash` 执行器，只依赖 bash 缝合线与 `ctx.sandbox`/`ctx.sandboxPolicy` 探测面——这些在 0808/0809 上均未变化，typecheck 与实机加载已验证。
+
+### 0809 兼容要点（实机验证）
+
+- 0809 运行中的 `dsh web` 下，本插件正常替换 `ctx.bash`（patch 停用 `bash-sandbox` + 插入本插件的接入方式不变）：每次 bash 调用 stderr 里的 WSL UTF-16LE 代理警告均被正确解码为中文，无乱码——核心修复路径实测有效。
+- 0809 保留 bash 缝合线（服务名 `ctx.bash` 与 `BashExecutor` 继承面）与 `ctx.sandbox`/`ctx.sandboxPolicy` 探测面，插件无需改动、沿用既有 `lib/` 构建即可。
+- 本插件无客户端 bundle，不受 0809 客户端插件机制（`dshClient` 声明/`ClientPackageCompositionError` 启动校验）影响。
 
 ## 使用环境（重点）
 
