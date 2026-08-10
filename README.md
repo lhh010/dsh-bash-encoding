@@ -13,6 +13,15 @@ UTF-16LE / UTF-8 / GBK 等编码并正确解码，修复 Windows/WSL 下 bash �
 - 0809 保留 bash 缝合线（服务名 `ctx.bash` 与 `BashExecutor` 继承面）与 `ctx.sandbox`/`ctx.sandboxPolicy` 探测面，插件无需改动、沿用既有 `lib/` 构建即可。
 - 本插件无客户端 bundle，不受 0809 客户端插件机制（`dshClient` 声明/`ClientPackageCompositionError` 启动校验）影响。
 
+## Windows 原生 profile 停用说明
+
+在 **Windows 原生（无 WSL）profile** 下，本插件默认**停用**（`cordis.patch.yml` 注释段），原因：
+
+- 平台层 `windows.cordis.patch.yml` 已插入 `pwsh-sandbox`（`SandboxPwshExecutor`），与本插件一样会注册 `ctx.bash`；同一 context 只允许一个 `ctx.bash` 实现，同时启用会启动失败（`service bash has been registered at <EncodingBashExecutorPlugin>`）。
+- 本插件以 `bash -c` 方式 spawn，面向 POSIX bash 组合（替换 `dsh-bash-local`）；Windows 原生 profile 走 pwsh 栈、无 bash runner，本就不适用。
+
+需要时（POSIX/WSL profile，或显式替换 `dsh-bash-local`）按下方「安装」节接入即可——这是 profile 配置层的停用决定，不是代码弃用。
+
 ## 使用环境（重点）
 
 本插件解决的是 **Windows + WSL 组合下的中文乱码**，典型触发条件：
