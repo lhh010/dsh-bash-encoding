@@ -7,7 +7,7 @@ UTF-16LE / UTF-8 / GBK 等编码并正确解码，修复 Windows/WSL 下 bash �
 
 兼容 DSH snapshot0808（`snapshots/20260808T121140Z`）与 snapshot0809（`snapshots/20260809T140917Z`）：宿主侧插件，替换 `ctx.bash` 执行器，只依赖 bash 缝合线与 `ctx.sandbox`/`ctx.sandboxPolicy` 探测面——这些在 0808/0809 上均未变化，typecheck 与实机加载已验证。
 
-**npm 发版兼容**：兼容 DSH npm 基线 `0.0.1-20260810T155924Z`（snapshot0810 的 npm 发版）。实测：npm 基线安装后运行时加载通过，单元测试 26 例中 25 通过（唯一失败为本机 WSL localhost 代理警告混入 stderr 的环境噪音，解码行为本身正确）。注意：`peerDependencies.cordis` 为 `^4.0.0-rc.7`，与基线自带 vendored `cordis@0.0.1-20260810T155924Z` 不匹配——纯 `npm install` 需加 `--legacy-peer-deps`；经 `dsh plugin`/pnpm 安装自动处理（为插件嵌套公网 cordis），运行不受影响。
+**npm 发版兼容**：兼容 DSH npm 发版 `@deepseek-ai/dsh@0.0.1-rc.1`（即 snapshot0810 的 npm 发版；`npx -p @deepseek-ai/dsh@0.0.1-rc.1 dsh web` 可访问指定版本并启动，lib 生产模式）。实测（同源本地基线）：npm 基线安装后运行时加载通过，单元测试 26 例中 25 通过（唯一失败为本机 WSL localhost 代理警告混入 stderr 的环境噪音，解码行为本身正确）。注意：`peerDependencies.cordis` 声明为 `^4.0.0-rc.7`，而 npm 发版将 vendored `cordis` 一并按 `0.0.1-rc.?` 统一预发布版本号发布——纯 `npm install` 报 peer 冲突（ERESOLVE）时加 `--legacy-peer-deps` 即可；经 `dsh plugin`/pnpm 安装自动处理，运行不受影响。
 
 ### 0809 兼容要点（实机验证）
 
