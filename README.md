@@ -7,6 +7,8 @@ UTF-16LE / UTF-8 / GBK 等编码并正确解码，修复 Windows/WSL 下 bash �
 
 兼容 DSH snapshot0808（`snapshots/20260808T121140Z`）与 snapshot0809（`snapshots/20260809T140917Z`）：宿主侧插件，替换 `ctx.bash` 执行器，只依赖 bash 缝合线与 `ctx.sandbox`/`ctx.sandboxPolicy` 探测面——这些在 0808/0809 上均未变化，typecheck 与实机加载已验证。
 
+**npm 发版兼容**：兼容 DSH npm 基线 `0.0.1-20260810T155924Z`（snapshot0810 的 npm 发版）。实测：npm 基线安装后运行时加载通过，单元测试 26 例中 25 通过（唯一失败为本机 WSL localhost 代理警告混入 stderr 的环境噪音，解码行为本身正确）。注意：`peerDependencies.cordis` 为 `^4.0.0-rc.7`，与基线自带 vendored `cordis@0.0.1-20260810T155924Z` 不匹配——纯 `npm install` 需加 `--legacy-peer-deps`；经 `dsh plugin`/pnpm 安装自动处理（为插件嵌套公网 cordis），运行不受影响。
+
 ### 0809 兼容要点（实机验证）
 
 - 0809 运行中的 `dsh web` 下，本插件正常替换 `ctx.bash`（patch 停用 `bash-sandbox` + 插入本插件的接入方式不变）：每次 bash 调用 stderr 里的 WSL UTF-16LE 代理警告均被正确解码为中文，无乱码——核心修复路径实测有效。
