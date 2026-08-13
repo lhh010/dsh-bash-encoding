@@ -1,5 +1,7 @@
 # dsh-bash-encoding
 
+**简体中文** | [English](./README.en.md)
+
 DSH bash 输出**编码自动识别**插件：替换 `ctx.bash`，自管 spawn 收集**原始字节**，自动检测
 UTF-16LE / UTF-8 / GBK 等编码并正确解码，修复 Windows/WSL 下 bash 工具的中文乱码。
 
