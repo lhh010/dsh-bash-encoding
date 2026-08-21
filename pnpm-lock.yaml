@@ -8,21 +8,21 @@ importers:
 
   .:
     devDependencies:
-      '@deepseek-ai/dsh-bash':
-        specifier: link:../.dsh/source/current/packages/bash/bash
-        version: link:../.dsh/source/current/packages/bash/bash
+      '@deepseek-ai/cordis':
+        specifier: link:../.dsh/source/current/vendor/cordis
+        version: link:../.dsh/source/current/vendor/cordis
       '@deepseek-ai/dsh-sandbox':
         specifier: link:../.dsh/source/current/packages/sandbox/sandbox
         version: link:../.dsh/source/current/packages/sandbox/sandbox
+      '@deepseek-ai/dsh-shell':
+        specifier: link:../.dsh/source/current/packages/shell/shell
+        version: link:../.dsh/source/current/packages/shell/shell
+      '@deepseek-ai/schemastery':
+        specifier: link:../.dsh/source/current/vendor/schemastery
+        version: link:../.dsh/source/current/vendor/schemastery
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.1
-      cordis:
-        specifier: link:../.dsh/source/current/vendor/cordis
-        version: link:../.dsh/source/current/vendor/cordis
-      schemastery:
-        specifier: link:../.dsh/source/current/vendor/schemastery
-        version: link:../.dsh/source/current/vendor/schemastery
       typescript:
         specifier: ^5.9.0
         version: 5.9.3

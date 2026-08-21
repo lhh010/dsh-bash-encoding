@@ -9,7 +9,14 @@ UTF-16LE / UTF-8 / GBK 等编码并正确解码，修复 Windows/WSL 下 bash �
 
 兼容 DSH snapshot0808（`snapshots/20260808T121140Z`）与 snapshot0809（`snapshots/20260809T140917Z`）：宿主侧插件，替换 `ctx.bash` 执行器，只依赖 bash 缝合线与 `ctx.sandbox`/`ctx.sandboxPolicy` 探测面——这些在 0808/0809 上均未变化，typecheck 与实机加载已验证。
 
-**npm 发版兼容**：兼容 DSH npm 发版 `@deepseek-ai/dsh@0.0.1-rc.1`（即 snapshot0810 的 npm 发版；`npx -p @deepseek-ai/dsh@0.0.1-rc.1 dsh web` 可访问指定版本并启动，lib 生产模式）。实测（同源本地基线）：npm 基线安装后运行时加载通过，单元测试 26 例中 25 通过（唯一失败为本机 WSL localhost 代理警告混入 stderr 的环境噪音，解码行为本身正确）。注意：`peerDependencies.cordis` 声明为 `^4.0.0-rc.7`，而 npm 发版将 vendored `cordis` 一并按 `0.0.1-rc.?` 统一预发布版本号发布——纯 `npm install` 报 peer 冲突（ERESOLVE）时加 `--legacy-peer-deps` 即可；经 `dsh plugin`/pnpm 安装自动处理，运行不受影响。
+**npm 发版兼容**：兼容 DSH npm 发版 `@deepseek-ai/dsh@0.1.1-rc.1`（v0.2.0 实机 typecheck/构建/测试通过，适配要点见下节）；旧 0.1.x 版本兼容 `@deepseek-ai/dsh@0.0.1-rc.1`（即 snapshot0810 的 npm 发版；`npx -p @deepseek-ai/dsh@0.0.1-rc.1 dsh web` 可访问指定版本并启动，lib 生产模式）。实测（同源本地基线）：npm 基线安装后运行时加载通过，单元测试 26 例中 25 通过（唯一失败为本机 WSL localhost 代理警告混入 stderr 的环境噪音，解码行为本身正确）。
+
+### 0.1.x 兼容要点（ctx.bash → ctx.shell 缝合线迁移，v0.2.0）
+
+- **缝合线改名**：0.1.0 npm 线将 bash 能力从 `ctx.bash`/`@deepseek-ai/dsh-bash` 整体迁移到 `ctx.shell`/`@deepseek-ai/dsh-shell`——`dsh-tool-bash` 现在消费 `ctx.shell`（`resolve`/`run`/`start`/`sandboxMode`），旧的 `@deepseek-ai/dsh-bash` 包不再发布，`dsh-bash-local` 成为 `ctx.shell` 的本地 provider（`LocalBashExecutor extends ShellExecutor`）。本插件 v0.2.0 同步迁移：`EncodingBashExecutor` 改继承 `@deepseek-ai/dsh-shell` 的 `ShellExecutor`（`super(ctx, "shell")` 注册 `ctx.shell`），spawn/解码/超时/后台生命周期逻辑不变，仍自管 spawn 保留原始字节
+- **依赖改名**：peer/devDependencies 由 `cordis`/`schemastery`/`@deepseek-ai/dsh-bash` 迁移为 `@deepseek-ai/cordis`/`@deepseek-ai/schemastery`/`@deepseek-ai/dsh-shell`（与官方 0.1.x 包名一致，纯 `npm install` 不再有 ERESOLVE peer 冲突，无需 `--legacy-peer-deps`）
+- **接入方式变化**：同一 context 只允许一个 `ctx.shell` provider。POSIX/WSL profile 下需**替换** `@deepseek-ai/dsh-bash-local`（而不是旧版的停用 `bash-sandbox`）；Windows 原生 profile 的 provider 是 `pwsh-sandbox`（`SandboxPwshExecutor` 同样注册 `ctx.shell`），本插件仍按下方「Windows 原生 profile 停用说明」保持停用
+- **验证**：DSH npm `0.1.1-rc.1` 基线 typecheck、构建、26 例单元测试（25 通过 + 1 例本机 WSL 代理警告环境噪音）与 0.1.0-rc.8 之前基线一致；运行加载验证见下节
 
 ### 0809 兼容要点（实机验证）
 
@@ -21,7 +28,7 @@ UTF-16LE / UTF-8 / GBK 等编码并正确解码，修复 Windows/WSL 下 bash �
 
 在 **Windows 原生（无 WSL）profile** 下，本插件默认**停用**（`cordis.patch.yml` 注释段），原因：
 
-- 平台层 `windows.cordis.patch.yml` 已插入 `pwsh-sandbox`（`SandboxPwshExecutor`），与本插件一样会注册 `ctx.bash`；同一 context 只允许一个 `ctx.bash` 实现，同时启用会启动失败（`service bash has been registered at <EncodingBashExecutorPlugin>`）。
+- 平台层 `windows.cordis.patch.yml` 已插入 `pwsh-sandbox`（`SandboxPwshExecutor`），与本插件一样会注册 `ctx.shell`；同一 context 只允许一个 `ctx.shell` provider，同时启用会启动失败（重复服务注册）。
 - 本插件以 `bash -c` 方式 spawn，面向 POSIX bash 组合（替换 `dsh-bash-local`）；Windows 原生 profile 走 pwsh 栈、无 bash runner，本就不适用。
 
 需要时（POSIX/WSL profile，或显式替换 `dsh-bash-local`）按下方「安装」节接入即可——这是 profile 配置层的停用决定，不是代码弃用。
@@ -132,9 +139,9 @@ pnpm add -w link:/path/to/dsh-bash-encoding
 
 ## 配置
 
-在 profile 的 `cordis.yml`（或 `cordis.patch.yml`）中**替换** bash 条目
-（`@deepseek-ai/dsh-bash-local` 或 `@deepseek-ai/dsh-bash-sandbox` 二选一被本插件替代；
-同一 context 只能有一个 `ctx.bash`）：
+在 profile 的 `cordis.yml`（或 `cordis.patch.yml`）中**替换** shell 条目
+（`@deepseek-ai/dsh-bash-local` 被本插件替代——v0.2.0 起本插件与
+`dsh-bash-local` 都注册 `ctx.shell`，同一 context 只能有一个 provider）：
 
 ```yaml
 # ... 原有其他条目不变 ...
@@ -194,10 +201,19 @@ pnpm test   # 26 个用例：解码内核 + 真实 spawn 端到端（UTF-16LE/GB
 
 ```
 src/decode-core.ts   # 编码检测内核（ChunkDecoder 流式分段解码）：纯函数、零依赖、可独立测试
-src/executor.ts      # EncodingBashExecutor：自管 spawn + 原始字节 + 检测解码 + 沙箱
+src/executor.ts      # EncodingBashExecutor（extends ShellExecutor）：自管 spawn + 原始字节 + 检测解码
 src/index.ts         # 插件入口（schemastery Config）
 tests/               # node:test 单元 + 端到端
 ```
+
+## 更新记录 / Changelog
+
+### 2026-08-20 · v0.2.0 — 迁移到 ctx.shell 缝合线（DSH 0.1.x）
+
+- **迁移**：`EncodingBashExecutor` 由继承 `@deepseek-ai/dsh-bash` 的 `BashExecutor`（注册 `ctx.bash`）改为继承 `@deepseek-ai/dsh-shell` 的 `ShellExecutor`（注册 `ctx.shell`）——0.1.0 npm 线把 bash 能力整体迁移到 `ctx.shell`，`dsh-tool-bash` 只消费新缝合线；spawn/编码解码/超时/后台生命周期逻辑不变
+- **依赖**：peer/devDependencies 迁移为 `@deepseek-ai/dsh-shell` + `@deepseek-ai/cordis` + `@deepseek-ai/schemastery`（官方 0.1.x 包名，纯 `npm install` 无 ERESOLVE）
+- **接入**：POSIX/WSL profile 下改为替换 `@deepseek-ai/dsh-bash-local`（同为 `ctx.shell` provider）；Windows 原生 profile 保持停用
+- **验证**：DSH npm `0.1.1-rc.1` 基线 typecheck、构建、26 例单测（25 通过 + 1 例本机 WSL 代理警告环境噪音，解码行为正确）
 
 ## 许可
 

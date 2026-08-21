@@ -7,12 +7,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { Context } from 'cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { EncodingBashExecutor } from '../lib/executor.js'
 
 /**
- * A fresh cordis context per executor: `BashExecutor`'s base constructor
- * registers `ctx.bash` via `provide`, and one service may be registered only
+ * A fresh cordis context per executor: `ShellExecutor`'s base constructor
+ * registers `ctx.shell` via `provide`, and one service may be registered only
  * once per context.
  */
 function makeExecutor(overrides = {}) {

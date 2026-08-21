@@ -1,23 +1,27 @@
 /**
  * `dsh-bash-encoding` plugin entry: registers the encoding-aware local bash
- * executor as `ctx.bash` (one implementation per context, cordis'
+ * executor as `ctx.shell` (one implementation per context, cordis'
  * standard duplicate-service rule). Mount it INSTEAD OF
  * `@deepseek-ai/dsh-bash-local` in the profile's cordis.yml:
  *
  * ```yaml
- * - id: bash
- *   name: '@dsh-external/dsh-bash-encoding'
- *   config:
- *     timeoutMs: 120000
+ * - insert:
+ *     - id: bash-local
+ *       name: '@dsh-external/dsh-bash-encoding'
+ *       config:
+ *         timeoutMs: 120000
  * ```
  *
- * The tool layer (`@deepseek-ai/dsh-tool-bash`) injects `ctx.bash` and needs
+ * The tool layer (`@deepseek-ai/dsh-tool-bash`) injects `ctx.shell` and needs
  * no changes; this plugin only swaps the implementation behind the seam.
+ * (0.1.0 migration: the seam moved from `ctx.bash`/`@deepseek-ai/dsh-bash` to
+ * `ctx.shell`/`@deepseek-ai/dsh-shell`; the spawn/decode mechanics are
+ * unchanged.)
  *
  * @module @dsh-external/dsh-bash-encoding
  */
 
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 import { EncodingBashExecutor } from './executor.js'
 
 export { EncodingBashExecutor } from './executor.js'
