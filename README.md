@@ -196,6 +196,11 @@ pnpm test   # 26 个用例：解码内核 + 真实 spawn 端到端（UTF-16LE/GB
 - **大输出**：超过 `maxOutputBytes` 保留头部并标记 `lossy`（不做 spill 文件）。
 - **治本建议**（可选，与插件互补）：将 `.wslconfig` 的 `networkingMode` 改为 `mirrored`，
   或设置 `WSL_UTF8=1`，可从源头消除 WSL 警告本身的输出。
+- **run_code / pwsh 路径不在插件覆盖范围**：本插件只替换 bash 工具背后的 `ctx.shell` provider。
+  Windows 原生 profile 下经由 pwsh（含 `run_code` 的 pwsh 执行器）调用 `wsl.exe` 产生的同款 UTF-16LE
+  警告乱码，插件无法拦截（那是 code-runtime/pwsh 栈的输出解码）。实测有效做法：在命令里前置
+  `WSL_UTF8=1`（如 `WSL_UTF8=1 wsl -e bash -c '...'`，wsl.exe 官方支持，警告改以 UTF-8 输出，
+  pwsh 捕获后即为正常中文），或改用 `.wslconfig` 镜像模式从根上消除该警告。
 
 ## 结构
 
